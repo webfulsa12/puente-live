@@ -279,6 +279,7 @@
   // isFinal para enviar. En su lugar acumulamos todo lo dicho en la sesión y
   // confirmamos la frase cuando detectamos SILENCIO (sin texto nuevo por 1.2s).
   const SILENCE_MS = 1200;
+  const IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '');
   let lastInterimSent = 0;
   let sessionText = '';    // todo lo ya confirmado dentro de la sesión actual
   let pendingText = '';    // lo que llevas dicho en la frase en curso
@@ -289,11 +290,24 @@
     return t.toLowerCase().trim().replace(/[.,!?¿¡]/g,'').replace(/\s+/g,' ');
   }
 
-  // Texto completo que el motor lleva reconocido en esta sesión
-  function buildFull(results){
-    let s = '';
-    for(let i = 0; i < results.length; i++) s += results[i][0].transcript;
-    return s.replace(/\s+/g,' ').trim();
+  // El motor de voz de Android no entrega tramos que se suman: va agregando
+  // COPIAS cada vez más largas de la misma frase. Si las concatenáramos saldría
+  // "HolaHolaHola Mateo". Aquí detectamos esas versiones y nos quedamos con la
+  // más completa, uniendo con espacio solo lo que de verdad es texto nuevo.
+  function mergeResults(results){
+    const parts = [];
+    for(let i = 0; i < results.length; i++){
+      const t = (results[i][0].transcript || '').replace(/\s+/g,' ').trim();
+      if(!t) continue;
+      const last = parts[parts.length - 1];
+      if(last !== undefined){
+        const a = last.toLowerCase(), b = t.toLowerCase();
+        if(b.startsWith(a)){ parts[parts.length - 1] = t; continue; } // versión ampliada
+        if(a.startsWith(b) || a.endsWith(b)) continue;                // ya contenida
+      }
+      parts.push(t);
+    }
+    return parts.join(' ').replace(/\s+/g,' ').trim();
   }
 
   function resetUtterance(){
@@ -318,12 +332,16 @@
 
   function buildRec(){
     const r = new SR();
-    r.lang = mySrLang; r.continuous = true; r.interimResults = true;
+    r.lang = mySrLang;
+    // En celular, el modo continuo de Android es errático: usamos modo por frase
+    // (el motor cierra cada frase por sí mismo) y lo reanudamos al terminar.
+    r.continuous = !IS_MOBILE;
+    r.interimResults = true;
 
     r.onstart = ()=>{ sessionText = ''; }; // cada sesión empieza de cero
 
     r.onresult = (e)=>{
-      const full = buildFull(e.results);
+      const full = mergeResults(e.results);
       if(!full) return;
 
       // Lo NUEVO es lo que aún no se ha confirmado. Funciona igual si el motor
@@ -345,9 +363,14 @@
         ws.send(JSON.stringify({ t:'interim', text }));
       }
 
-      // Reinicia el reloj de silencio: si dejas de hablar 1.2s, se confirma la frase
       clearTimeout(silenceTimer);
-      silenceTimer = setTimeout(()=> commitUtterance(full), SILENCE_MS);
+      const closed = e.results[e.results.length - 1].isFinal;
+      if(!r.continuous && closed){
+        commitUtterance(full);          // el motor ya cerró la frase: se envía al instante
+      } else {
+        // Respaldo: si dejas de hablar 1.2s, se confirma la frase igual
+        silenceTimer = setTimeout(()=> commitUtterance(full), SILENCE_MS);
+      }
     };
     r.onerror = (e)=>{
       if(e.error === 'not-allowed'){
