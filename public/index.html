@@ -196,11 +196,34 @@
   function sysMsg(text){ addBubble('sys', text); }
 
   // ---------- WebSocket ----------
+  let session = null;        // {code, lang, name} — permite reconectar a la misma sala
+  let reconnectTimer = null;
+
+  function rejoin(){
+    connect(()=> ws.send(JSON.stringify({ t:'join', code: session.code, lang: session.lang, name: session.name })));
+  }
+  function scheduleReconnect(){
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(()=>{
+      if(!session) return;
+      if(document.hidden){ scheduleReconnect(); return; } // espera a que la app vuelva al frente
+      rejoin();
+    }, 1500);
+  }
+  // Al volver de WhatsApp u otra app, reconecta solo si la conexión se cayó
+  document.addEventListener('visibilitychange', ()=>{
+    if(!document.hidden && session && (!ws || ws.readyState > 1)) rejoin();
+    if(!document.hidden && 'wakeLock' in navigator) navigator.wakeLock.request('screen').catch(()=>{});
+  });
+
   function connect(then){
     const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
     ws = new WebSocket(proto + location.host);
     ws.onopen = then;
-    ws.onclose = ()=>{ showToast('Conexión perdida. Recarga la página para volver a entrar.'); };
+    ws.onclose = ()=>{
+      if(session){ scheduleReconnect(); }         // en sala: reconexión silenciosa
+      else showToast('No se pudo conectar. Revisa tu internet e intenta de nuevo.');
+    };
     ws.onmessage = (ev)=>{
       let m; try{ m = JSON.parse(ev.data); }catch(_){ return; }
 
@@ -208,7 +231,10 @@
 
       if(m.t === 'joined'){
         myId = m.you;
-        enterRoom(m.code, m.members);
+        const firstTime = !session;
+        session = { code: m.code, lang: myLang, name: myName };
+        if(firstTime){ enterRoom(m.code, m.members); }
+        else { updateMembers(m.members); sysMsg('Reconectado ✓'); if(micOn && !playingIncoming) resumeRec(); }
         return;
       }
       if(m.t === 'members'){
