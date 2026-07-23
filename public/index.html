@@ -274,35 +274,80 @@
   }
 
   // ---------- Reconocimiento de voz ----------
+  // Android NO avisa de forma fiable cuándo termina una frase: va emitiendo
+  // resultados "finales" que crecen palabra por palabra. Por eso NO confiamos en
+  // isFinal para enviar. En su lugar acumulamos todo lo dicho en la sesión y
+  // confirmamos la frase cuando detectamos SILENCIO (sin texto nuevo por 1.2s).
+  const SILENCE_MS = 1200;
   let lastInterimSent = 0;
+  let sessionText = '';    // todo lo ya confirmado dentro de la sesión actual
+  let pendingText = '';    // lo que llevas dicho en la frase en curso
+  let silenceTimer = null;
+  let lastCommitted = '', lastCommitTime = 0;
+
+  function normalize(t){
+    return t.toLowerCase().trim().replace(/[.,!?¿¡]/g,'').replace(/\s+/g,' ');
+  }
+
+  // Texto completo que el motor lleva reconocido en esta sesión
+  function buildFull(results){
+    let s = '';
+    for(let i = 0; i < results.length; i++) s += results[i][0].transcript;
+    return s.replace(/\s+/g,' ').trim();
+  }
+
+  function resetUtterance(){
+    clearTimeout(silenceTimer);
+    pendingText = '';
+    if(interimBubble){ interimBubble.remove(); interimBubble = null; }
+  }
+
+  function commitUtterance(fullAtTime){
+    const text = pendingText.trim();
+    const norm = normalize(text);
+    const now = Date.now();
+    sessionText = fullAtTime; // a partir de aquí, solo cuenta lo nuevo
+    resetUtterance();
+    if(!text) return;
+    // Red de seguridad: descarta una frase idéntica repetida en menos de 5s
+    if(norm === lastCommitted && (now - lastCommitTime) < 5000) return;
+    lastCommitted = norm; lastCommitTime = now;
+    addBubble('mine', text);
+    if(ws && ws.readyState === 1) ws.send(JSON.stringify({ t:'final', text }));
+  }
+
   function buildRec(){
     const r = new SR();
     r.lang = mySrLang; r.continuous = true; r.interimResults = true;
+
+    r.onstart = ()=>{ sessionText = ''; }; // cada sesión empieza de cero
+
     r.onresult = (e)=>{
-      let interim = '';
-      for(let i = e.resultIndex; i < e.results.length; i++){
-        const res = e.results[i];
-        if(res.isFinal){
-          const text = res[0].transcript.trim();
-          if(interimBubble){ interimBubble.remove(); interimBubble = null; }
-          if(text){
-            addBubble('mine', text);
-            if(ws && ws.readyState === 1) ws.send(JSON.stringify({ t:'final', text }));
-          }
-        } else {
-          interim += res[0].transcript;
-        }
+      const full = buildFull(e.results);
+      if(!full) return;
+
+      // Lo NUEVO es lo que aún no se ha confirmado. Funciona igual si el motor
+      // acumula los resultados o si los reemplaza al empezar otra frase.
+      let text;
+      if(sessionText && full.startsWith(sessionText)) text = full.slice(sessionText.length).trim();
+      else { sessionText = ''; text = full; }
+      if(!text) return; // todavía no hay nada nuevo: el reloj de silencio sigue corriendo
+
+      pendingText = text;
+      if(!interimBubble) interimBubble = addBubble('mine interim', '');
+      interimBubble._text.textContent = text;
+      $('log').scrollTop = $('log').scrollHeight;
+
+      // Vista previa al otro celular mientras sigues hablando
+      const now = Date.now();
+      if(now - lastInterimSent > 900 && ws && ws.readyState === 1){
+        lastInterimSent = now;
+        ws.send(JSON.stringify({ t:'interim', text }));
       }
-      if(interim){
-        if(!interimBubble) interimBubble = addBubble('mine interim', '');
-        interimBubble._text.textContent = interim;
-        $('log').scrollTop = $('log').scrollHeight;
-        const now = Date.now();
-        if(now - lastInterimSent > 900 && ws && ws.readyState === 1){
-          lastInterimSent = now;
-          ws.send(JSON.stringify({ t:'interim', text: interim }));
-        }
-      }
+
+      // Reinicia el reloj de silencio: si dejas de hablar 1.2s, se confirma la frase
+      clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(()=> commitUtterance(full), SILENCE_MS);
     };
     r.onerror = (e)=>{
       if(e.error === 'not-allowed'){
@@ -311,6 +356,9 @@
       }
     };
     r.onend = ()=>{
+      // Al cortarse la sesión, envía lo que quedó pendiente para no perder palabras
+      if(pendingText.trim()) commitUtterance('');
+      sessionText = '';
       // El motor se corta solo cada cierto tiempo: se reanuda si el mic sigue activo
       if(micOn && !playingIncoming){ try{ r.start(); }catch(_){} }
     };
@@ -329,7 +377,7 @@
       try{ rec.start(); }catch(_){}
     } else {
       pauseRec();
-      if(interimBubble){ interimBubble.remove(); interimBubble = null; }
+      resetUtterance();
     }
   }
   $('micBtn').addEventListener('click', ()=> setMic(!micOn));
