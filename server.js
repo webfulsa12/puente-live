@@ -18,7 +18,17 @@ const wss = new WebSocketServer({ server });
 // ---------- Salas ----------
 // rooms: código -> Set de clientes (ws). Cada ws lleva ws.meta = {id, room, lang, name}
 const rooms = new Map();
+const emptyTimers = new Map(); // salas vacías en periodo de gracia antes de eliminarse
+const GRACE_MS = 10 * 60 * 1000; // 10 minutos
 let nextId = 1;
+
+function keepRoomAlive(code) {
+  // Cancela la eliminación pendiente si alguien vuelve a entrar
+  if (emptyTimers.has(code)) {
+    clearTimeout(emptyTimers.get(code));
+    emptyTimers.delete(code);
+  }
+}
 
 function genCode() {
   const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // sin letras/números confusos
@@ -100,13 +110,16 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // Unirse a sala existente
+    // Unirse a sala (si no existe, se crea con ese mismo código:
+    // así una sala expirada revive y no importa quién llega primero)
     if (msg.t === 'join') {
       const code = String(msg.code || '').toUpperCase().trim();
-      if (!rooms.has(code)) {
-        ws.send(JSON.stringify({ t: 'error', msg: 'La sala ' + code + ' no existe o ya se cerró.' }));
+      if (code.length !== 4) {
+        ws.send(JSON.stringify({ t: 'error', msg: 'Código de sala inválido.' }));
         return;
       }
+      keepRoomAlive(code);
+      if (!rooms.has(code)) rooms.set(code, new Set());
       m.lang = String(msg.lang || 'es').slice(0, 2);
       m.name = String(msg.name || '').slice(0, 30);
       m.room = code;
@@ -161,8 +174,18 @@ wss.on('connection', (ws) => {
     if (m.room && rooms.has(m.room)) {
       const set = rooms.get(m.room);
       set.delete(ws);
-      if (set.size === 0) rooms.delete(m.room);
-      else broadcast(m.room, { t: 'members', members: membersOf(m.room) });
+      if (set.size === 0) {
+        // No se elimina de inmediato: sobrevive el periodo de gracia
+        // (cubre el caso de ir a WhatsApp a enviar la invitación)
+        const code = m.room;
+        keepRoomAlive(code);
+        emptyTimers.set(code, setTimeout(() => {
+          rooms.delete(code);
+          emptyTimers.delete(code);
+        }, GRACE_MS));
+      } else {
+        broadcast(m.room, { t: 'members', members: membersOf(m.room) });
+      }
     }
   });
 });
