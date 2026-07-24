@@ -11,15 +11,78 @@ const { WebSocketServer } = require('ws');
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json());
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
+
+// ---------- Códigos de acceso (candado para CREAR salas) ----------
+// Pensado para el modelo de alquiler: cada cliente (hotel, operador, parroquia)
+// recibe un código propio, válido por las horas de su alquiler. Vive en memoria:
+// se reinicia si el servidor se reinicia (ver README sobre el plan gratuito de Render).
+// El candado solo se activa cuando defines ADMIN_KEY en el servidor — mientras no
+// exista, "crear sala" funciona libre, igual que hasta ahora.
+const accessCodes = new Map(); // code -> {label, createdAt, expiresAt, maxUses, uses}
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+
+function genAccessCode() {
+  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  let c = 'COD-';
+  for (let i = 0; i < 6; i++) c += chars[Math.floor(Math.random() * chars.length)];
+  return accessCodes.has(c) ? genAccessCode() : c;
+}
+
+function validateAccessCode(code) {
+  const d = accessCodes.get(code);
+  if (!d) return 'Código de acceso inválido.';
+  if (d.expiresAt && Date.now() > d.expiresAt) return 'Este código de acceso ya venció.';
+  if (d.maxUses && d.uses >= d.maxUses) return 'Este código alcanzó su límite de usos.';
+  return null;
+}
+
+function checkAdmin(req, res) {
+  if (!ADMIN_KEY) { res.status(503).json({ error: 'Configura ADMIN_KEY en el servidor para activar el panel.' }); return false; }
+  if (req.headers['x-admin-key'] !== ADMIN_KEY) { res.status(401).json({ error: 'Clave de administrador incorrecta.' }); return false; }
+  return true;
+}
+
+// Lista de códigos (activos y vencidos, para que Pedro vea el historial)
+app.get('/admin/api/codes', (req, res) => {
+  if (!checkAdmin(req, res)) return;
+  const list = [...accessCodes.entries()]
+    .map(([code, d]) => ({ code, ...d, expired: d.expiresAt ? Date.now() > d.expiresAt : false }))
+    .sort((a, b) => b.createdAt - a.createdAt);
+  res.json({ codes: list, lockEnabled: true });
+});
+
+// Genera un código nuevo: label identifica al cliente, hours es su ventana de alquiler
+app.post('/admin/api/codes', (req, res) => {
+  if (!checkAdmin(req, res)) return;
+  const { label, hours, maxUses } = req.body || {};
+  const h = Number(hours) > 0 ? Number(hours) : 24;
+  const code = genAccessCode();
+  accessCodes.set(code, {
+    label: String(label || 'Sin nombre').slice(0, 60),
+    createdAt: Date.now(),
+    expiresAt: Date.now() + h * 60 * 60 * 1000,
+    maxUses: (maxUses && Number(maxUses) > 0) ? Number(maxUses) : null,
+    uses: 0
+  });
+  res.json({ code });
+});
+
+app.delete('/admin/api/codes/:code', (req, res) => {
+  if (!checkAdmin(req, res)) return;
+  accessCodes.delete(req.params.code);
+  res.json({ ok: true });
+});
 
 // ---------- Salas ----------
 // rooms: código -> Set de clientes (ws). Cada ws lleva ws.meta = {id, room, lang, name}
 const rooms = new Map();
 const emptyTimers = new Map(); // salas vacías en periodo de gracia antes de eliminarse
 const GRACE_MS = 10 * 60 * 1000; // 10 minutos
+const MAX_ROOM_SIZE = 2; // conversación 1 a 1. Súbelo si más adelante quieres tours grupales.
 let nextId = 1;
 
 function keepRoomAlive(code) {
@@ -92,7 +155,9 @@ async function translateForRoom(code, text, fromLang) {
 
 // ---------- Protocolo WebSocket ----------
 wss.on('connection', (ws) => {
-  ws.meta = { id: nextId++, room: null, lang: 'es', name: '', lastInterim: 0 };
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+  ws.meta = { id: nextId++, room: null, lang: 'es', name: '', clientId: '', lastInterim: 0 };
 
   ws.on('message', async (raw) => {
     let msg;
@@ -101,9 +166,16 @@ wss.on('connection', (ws) => {
 
     // Crear sala
     if (msg.t === 'create') {
+      if (ADMIN_KEY) { // el candado solo se activa cuando tú lo enciendes con ADMIN_KEY
+        const accessCode = String(msg.accessCode || '').toUpperCase().trim();
+        const err = validateAccessCode(accessCode);
+        if (err) { ws.send(JSON.stringify({ t: 'error', msg: err })); return; }
+        accessCodes.get(accessCode).uses++;
+      }
       const code = genCode();
       m.lang = String(msg.lang || 'es').slice(0, 2);
       m.name = String(msg.name || '').slice(0, 30);
+      m.clientId = String(msg.clientId || '').slice(0, 64);
       m.room = code;
       rooms.set(code, new Set([ws]));
       ws.send(JSON.stringify({ t: 'joined', code, you: m.id, members: membersOf(code) }));
@@ -120,10 +192,34 @@ wss.on('connection', (ws) => {
       }
       keepRoomAlive(code);
       if (!rooms.has(code)) rooms.set(code, new Set());
+      const set = rooms.get(code);
+      const clientId = String(msg.clientId || '').slice(0, 64);
+
+      // Si este mismo dispositivo ya tenía una conexión en la sala (reconexión
+      // tras ir a WhatsApp, cambiar de red, etc.), se reemplaza: no ocupa cupo nuevo.
+      if (clientId) {
+        for (const other of set) {
+          if (other !== ws && other.meta.clientId === clientId) {
+            set.delete(other);
+            try { other.close(); } catch (_) { /* ya estaba muerta */ }
+          }
+        }
+      }
+
+      // Cupo lleno: bloquea a cualquier tercero que no sea ya parte de la sala
+      if (set.size >= MAX_ROOM_SIZE && !set.has(ws)) {
+        ws.send(JSON.stringify({
+          t: 'error',
+          msg: 'Esta sala ya tiene ' + MAX_ROOM_SIZE + ' personas conectadas. Pide al anfitrión que cree una sala nueva.'
+        }));
+        return;
+      }
+
       m.lang = String(msg.lang || 'es').slice(0, 2);
       m.name = String(msg.name || '').slice(0, 30);
+      m.clientId = clientId;
       m.room = code;
-      rooms.get(code).add(ws);
+      set.add(ws);
       ws.send(JSON.stringify({ t: 'joined', code, you: m.id, members: membersOf(code) }));
       broadcast(code, { t: 'members', members: membersOf(code) }, ws);
       return;
@@ -189,6 +285,19 @@ wss.on('connection', (ws) => {
     }
   });
 });
+
+// Cada 20s pregunta "¿sigues ahí?"; si no contestó al latido anterior, lo da de baja
+// (dispara 'close' arriba, que ya limpia la sala). Cubre el caso de una app cerrada
+// del todo, sin pasar por una reconexión que la identidad de dispositivo pudiera detectar.
+const HEARTBEAT_MS = 20000;
+const heartbeatTimer = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) { try { ws.terminate(); } catch (_) {} return; }
+    ws.isAlive = false;
+    try { ws.ping(); } catch (_) {}
+  });
+}, HEARTBEAT_MS);
+wss.on('close', () => clearInterval(heartbeatTimer));
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log('Puente Live escuchando en el puerto ' + PORT));
