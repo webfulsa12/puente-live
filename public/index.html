@@ -111,6 +111,11 @@
     </select>
   </div>
 
+  <div>
+    <label>Código de acceso (solo para crear sala)</label>
+    <input id="inAccessCode" placeholder="COD-XXXXXX · déjalo vacío si aún no tienes uno" maxlength="20"
+           style="text-transform:uppercase">
+  </div>
   <button class="btn create" id="btnCreate">Crear sala nueva</button>
   <div class="divider">— o únete a una sala existente —</div>
   <div>
@@ -196,11 +201,24 @@
   function sysMsg(text){ addBubble('sys', text); }
 
   // ---------- WebSocket ----------
+  // Identidad propia de este celular: así el servidor reconoce "eres tú de nuevo"
+  // en vez de sumarte como una persona más cada vez que vuelves de otra app.
+  function getClientId(){
+    try{
+      let id = localStorage.getItem('puente_client_id');
+      if(!id){ id = 'c_' + Math.random().toString(36).slice(2) + Date.now().toString(36); localStorage.setItem('puente_client_id', id); }
+      return id;
+    }catch(_){ return 'c_' + Math.random().toString(36).slice(2); } // por si el navegador bloquea almacenamiento
+  }
+  const CLIENT_ID = getClientId();
+
   let session = null;        // {code, lang, name} — permite reconectar a la misma sala
   let reconnectTimer = null;
 
   function rejoin(){
-    connect(()=> ws.send(JSON.stringify({ t:'join', code: session.code, lang: session.lang, name: session.name })));
+    // Cierra la conexión anterior si seguía viva a medias, para no dejar fantasmas
+    if(ws && ws.readyState <= 1){ try{ ws.close(); }catch(_){} }
+    connect(()=> ws.send(JSON.stringify({ t:'join', code: session.code, lang: session.lang, name: session.name, clientId: CLIENT_ID })));
   }
   function scheduleReconnect(){
     clearTimeout(reconnectTimer);
@@ -435,13 +453,14 @@
   }
   $('btnCreate').addEventListener('click', ()=>{
     readLobby();
-    connect(()=> ws.send(JSON.stringify({ t:'create', lang: myLang, name: myName })));
+    const accessCode = $('inAccessCode').value.trim().toUpperCase();
+    connect(()=> ws.send(JSON.stringify({ t:'create', lang: myLang, name: myName, clientId: CLIENT_ID, accessCode })));
   });
   $('btnJoin').addEventListener('click', ()=>{
     readLobby();
     const code = $('inCode').value.trim().toUpperCase();
     if(code.length !== 4){ showToast('Ingresa el código de 4 letras de la sala.'); return; }
-    connect(()=> ws.send(JSON.stringify({ t:'join', code, lang: myLang, name: myName })));
+    connect(()=> ws.send(JSON.stringify({ t:'join', code, lang: myLang, name: myName, clientId: CLIENT_ID })));
   });
 
   // Si llega por enlace compartido (?sala=XXXX), precarga el código

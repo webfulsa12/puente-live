@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Puente Live · Panel de acceso</title>
+<style>
+  :root{ --bg:#0d1220; --panel:#141b2e; --line:#232c45; --acc:#2fb8c6; --text:#eef1f8; --dim:#8a93ab; --bad:#e5484d; --ok:#4cc38a; }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);padding:20px;max-width:680px;margin:0 auto}
+  h1{font-size:20px;margin:10px 0 4px}
+  p.sub{color:var(--dim);font-size:13px;margin:0 0 20px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
+  label{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
+  input{width:100%;padding:11px;border-radius:8px;border:1px solid var(--line);background:#0d1220;color:var(--text);font-size:15px;margin:5px 0 12px}
+  .row{display:flex;gap:10px}
+  .row > div{flex:1}
+  button{padding:11px 16px;border:none;border-radius:8px;background:var(--acc);color:#04222a;font-weight:700;cursor:pointer;font-size:14px}
+  button.danger{background:var(--bad);color:#fff}
+  button:disabled{opacity:.5;cursor:default}
+  table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
+  th{text-align:left;color:var(--dim);font-weight:600;padding:6px;border-bottom:1px solid var(--line)}
+  td{padding:8px 6px;border-bottom:1px solid var(--line)}
+  .pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700}
+  .pill.ok{background:rgba(76,195,138,.15);color:var(--ok)}
+  .pill.bad{background:rgba(229,72,77,.15);color:var(--bad)}
+  code{background:#0d1220;padding:2px 7px;border-radius:5px;font-size:14px;letter-spacing:1px}
+  .msg{font-size:13px;padding:10px;border-radius:8px;margin-bottom:12px;display:none}
+  .msg.show{display:block}
+  .msg.err{background:rgba(229,72,77,.12);color:#ffb3b6}
+  .msg.ok{background:rgba(76,195,138,.12);color:var(--ok)}
+  #gate{max-width:340px;margin:60px auto}
+  #panel{display:none}
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <h1>Panel de acceso · Puente Live</h1>
+  <p class="sub">Ingresa tu clave de administrador para generar códigos.</p>
+  <div class="card">
+    <label>Clave de administrador</label>
+    <input id="adminKey" type="password" placeholder="Tu ADMIN_KEY">
+    <button id="btnEnter" style="width:100%">Entrar</button>
+    <div class="msg err" id="gateMsg"></div>
+  </div>
+</div>
+
+<div id="panel">
+  <h1>Panel de acceso · Puente Live</h1>
+  <p class="sub">Genera un código por cada cliente que alquila el servicio. Solo con un código válido se puede crear una sala nueva.</p>
+
+  <div class="msg" id="formMsg"></div>
+  <div class="card">
+    <label>Nombre del cliente</label>
+    <input id="fLabel" placeholder="Ej: Hotel Costa del Sol - Nov 15">
+    <div class="row">
+      <div>
+        <label>Horas de validez</label>
+        <input id="fHours" type="number" value="24" min="1">
+      </div>
+      <div>
+        <label>Máximo de usos (vacío = ilimitado)</label>
+        <input id="fMax" type="number" placeholder="Ilimitado">
+      </div>
+    </div>
+    <button id="btnCreate">Generar código</button>
+  </div>
+
+  <div class="card">
+    <table id="tbl">
+      <thead><tr><th>Código</th><th>Cliente</th><th>Vence</th><th>Usos</th><th>Estado</th><th></th></tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+(function(){
+  const $ = id => document.getElementById(id);
+  let KEY = '';
+
+  function api(path, opts={}){
+    return fetch(path, { ...opts, headers: { 'Content-Type':'application/json', 'x-admin-key': KEY, ...(opts.headers||{}) } })
+      .then(async r => { const d = await r.json().catch(()=>({})); if(!r.ok) throw new Error(d.error || 'Error'); return d; });
+  }
+
+  function fmtDate(ms){ return new Date(ms).toLocaleString('es-PE', { day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit' }); }
+
+  function render(codes){
+    $('tbody').innerHTML = codes.map(c => `
+      <tr>
+        <td><code>${c.code}</code></td>
+        <td>${c.label}</td>
+        <td>${fmtDate(c.expiresAt)}</td>
+        <td>${c.uses}${c.maxUses ? ' / ' + c.maxUses : ''}</td>
+        <td><span class="pill ${c.expired ? 'bad' : 'ok'}">${c.expired ? 'Vencido' : 'Activo'}</span></td>
+        <td><button class="danger" data-code="${c.code}">Revocar</button></td>
+      </tr>`).join('') || '<tr><td colspan="6" style="color:var(--dim)">Sin códigos todavía.</td></tr>';
+
+    $('tbody').querySelectorAll('button[data-code]').forEach(b=>{
+      b.addEventListener('click', async ()=>{
+        if(!confirm('¿Revocar el código ' + b.dataset.code + '?')) return;
+        await api('/admin/api/codes/' + b.dataset.code, { method:'DELETE' });
+        load();
+      });
+    });
+  }
+
+  async function load(){
+    const d = await api('/admin/api/codes');
+    render(d.codes);
+  }
+
+  $('btnEnter').addEventListener('click', async ()=>{
+    KEY = $('adminKey').value;
+    try{
+      await load();
+      $('gate').style.display = 'none';
+      $('panel').style.display = 'block';
+    }catch(e){
+      $('gateMsg').textContent = e.message;
+      $('gateMsg').classList.add('show');
+    }
+  });
+
+  $('btnCreate').addEventListener('click', async ()=>{
+    const label = $('fLabel').value.trim();
+    if(!label){ $('fLabel').focus(); return; }
+    try{
+      const d = await api('/admin/api/codes', {
+        method:'POST',
+        body: JSON.stringify({ label, hours: $('fHours').value, maxUses: $('fMax').value })
+      });
+      $('formMsg').textContent = 'Código generado: ' + d.code;
+      $('formMsg').className = 'msg ok show';
+      $('fLabel').value = '';
+      load();
+    }catch(e){
+      $('formMsg').textContent = e.message;
+      $('formMsg').className = 'msg err show';
+    }
+  });
+})();
+</script>
+</body>
+</html>
