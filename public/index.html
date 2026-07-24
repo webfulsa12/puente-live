@@ -4,6 +4,13 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>Puente Live · Cada quien habla su idioma</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0d1220">
+<link rel="icon" href="/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/icons/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Puente">
 <style>
   :root{
     --bg:#0d1220; --panel:#141b2e; --line:#232c45;
@@ -487,6 +494,11 @@
   // Si llega por enlace compartido (?sala=XXXX), precarga el código
   const params = new URLSearchParams(location.search);
   if(params.get('sala')) $('inCode').value = params.get('sala').toUpperCase();
+
+  // Habilita "Instalar app" en el celular (Android/Chrome principalmente)
+  if('serviceWorker' in navigator){
+    navigator.serviceWorker.register('/service-worker.js').catch(()=>{});
+  }
 })();
 </script>
 </body>
