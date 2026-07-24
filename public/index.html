@@ -64,6 +64,7 @@
   .mine.interim{opacity:.55;font-style:italic}
   .theirs{align-self:flex-start;background:rgba(47,184,198,.14);border-left:3px solid var(--them)}
   .theirs.preview{opacity:.6;border:1px dashed var(--dim);background:transparent}
+  .theirs.failed{background:rgba(229,72,77,.12);border-left:3px solid var(--me);color:#ffd0d0}
   .sys{align-self:center;color:var(--dim);font-size:12px;background:var(--panel);
     border-radius:20px;padding:4px 14px}
 
@@ -296,16 +297,22 @@
       }
       if(m.t === 'speech'){
         const prev = previews.get(m.id);
-        if(prev){
-          prev.classList.remove('preview');
-          prev._text.textContent = m.text;
-          previews.delete(m.id);
+        if(m.ok){
+          const shown = m.translated;
+          if(prev){ prev.classList.remove('preview'); prev._text.textContent = shown; previews.delete(m.id); }
+          else { addBubble('theirs', shown, m.name || 'Participante'); }
+          // Pausa mi micrófono SOLO mientras suena la voz entrante en MI celular,
+          // para que mi propio parlante no contamine mi micrófono.
+          playIncoming(shown);
         } else {
-          addBubble('theirs', m.text, m.name || 'Participante');
+          // La traducción falló (cupo diario de MyMemory agotado, o error de red).
+          // Se muestra el original con aviso, y NO se lee en voz — leer texto sin
+          // traducir en el idioma equivocado es justo lo que causaba la confusión.
+          const label = '⚠ no se pudo traducir: "' + m.original + '"';
+          if(prev){ prev.classList.remove('preview'); prev.classList.add('failed'); prev._text.textContent = label; previews.delete(m.id); }
+          else { addBubble('theirs failed', label, m.name || 'Participante'); }
+          showToast('No se pudo traducir un mensaje (posible límite diario del traductor).');
         }
-        // Pausa mi micrófono SOLO mientras suena la voz entrante en MI celular,
-        // para que mi propio parlante no contamine mi micrófono.
-        playIncoming(m.text);
         return;
       }
     };
@@ -404,7 +411,7 @@
 
       // Vista previa al otro celular mientras sigues hablando
       const now = Date.now();
-      if(now - lastInterimSent > 900 && ws && ws.readyState === 1){
+      if(now - lastInterimSent > 1800 && ws && ws.readyState === 1){
         lastInterimSent = now;
         ws.send(JSON.stringify({ t:'interim', text }));
       }
