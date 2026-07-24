@@ -155,14 +155,18 @@ async function translateForRoom(code, text, fromLang) {
 
 // ---------- Protocolo WebSocket ----------
 wss.on('connection', (ws) => {
-  ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
+  ws.lastSeen = Date.now(); // se actualiza con cada mensaje real que llega del celular
   ws.meta = { id: nextId++, room: null, lang: 'es', name: '', clientId: '', lastInterim: 0 };
 
   ws.on('message', async (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch (_) { return; }
+    ws.lastSeen = Date.now();
     const m = ws.meta;
+
+    // Latido de aplicación: el celular avisa "aquí sigo" cada 15s. No hace nada
+    // más que mantener lastSeen al día (ya se actualizó arriba).
+    if (msg.t === 'ping') return;
 
     // Crear sala
     if (msg.t === 'create') {
@@ -286,15 +290,17 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Cada 20s pregunta "¿sigues ahí?"; si no contestó al latido anterior, lo da de baja
-// (dispara 'close' arriba, que ya limpia la sala). Cubre el caso de una app cerrada
-// del todo, sin pasar por una reconexión que la identidad de dispositivo pudiera detectar.
+// Cada 20s revisa cuánto hace que cada celular mandó su último mensaje real
+// (incluye el latido de aplicación 'ping' cada 15s). Si pasaron más de 45s sin
+// noticias, se da de baja: cubre el caso de una app cerrada del todo.
+// A propósito NO se usa ping/pong de WebSocket a nivel de protocolo: algunos
+// proxies de hosting no lo dejan pasar bien, y eso causaba desconexiones falsas.
+const STALE_MS = 45000;
 const HEARTBEAT_MS = 20000;
 const heartbeatTimer = setInterval(() => {
+  const now = Date.now();
   wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) { try { ws.terminate(); } catch (_) {} return; }
-    ws.isAlive = false;
-    try { ws.ping(); } catch (_) {}
+    if (now - (ws.lastSeen || 0) > STALE_MS) { try { ws.terminate(); } catch (_) {} }
   });
 }, HEARTBEAT_MS);
 wss.on('close', () => clearInterval(heartbeatTimer));
