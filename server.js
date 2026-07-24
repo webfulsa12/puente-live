@@ -118,6 +118,13 @@ function broadcast(code, payload, exceptWs = null) {
 // ---------- Traducción (MyMemory: gratuita, sin clave) ----------
 // NOTA ESTRATÉGICA: esta función es el único punto a reemplazar cuando
 // pasemos a la API de Claude + glosario cultural. Todo lo demás queda igual.
+//
+// AVISO DE CUPO: MyMemory permite 5,000 caracteres/día de forma anónima desde
+// la IP del servidor (compartidos entre TODOS los que usen Puente Live ese
+// día), o 50,000/día si defines MYMEMORY_EMAIL en Render con tu correo. Con
+// varias salas de alquiler activas el mismo día del evento de noviembre, esto
+// puede seguir quedándose corto — es la razón de fondo para migrar a la API
+// de Claude cuando el negocio lo justifique.
 function decodeEntities(s) {
   return s
     .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
@@ -125,30 +132,40 @@ function decodeEntities(s) {
 }
 
 const cache = new Map(); // clave: from|to|texto -> traducción (evita llamadas repetidas)
+const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL || '';
 
 async function translate(text, from, to) {
   if (from === to) return text;
   const key = from + '|' + to + '|' + text;
   if (cache.has(key)) return cache.get(key);
+  const emailParam = MYMEMORY_EMAIL ? '&de=' + encodeURIComponent(MYMEMORY_EMAIL) : '';
   const url = 'https://api.mymemory.translated.net/get?q=' +
-    encodeURIComponent(text) + '&langpair=' + from + '|' + to;
+    encodeURIComponent(text) + '&langpair=' + from + '|' + to + emailParam;
   const res = await fetch(url);
   if (!res.ok) throw new Error('HTTP ' + res.status);
   const data = await res.json();
+  // MyMemory a veces responde HTTP 200 pero con un aviso de cupo agotado
+  // DISFRAZADO de traducción exitosa. Hay que detectarlo a mano.
+  if (data?.responseStatus && Number(data.responseStatus) !== 200) {
+    throw new Error('MyMemory respondió estado ' + data.responseStatus);
+  }
   const out = decodeEntities((data?.responseData?.translatedText || '').trim());
-  if (!out) throw new Error('sin resultado');
+  if (!out || /MYMEMORY WARNING/i.test(out)) throw new Error('cupo diario agotado o sin resultado');
   if (cache.size > 2000) cache.clear();
   cache.set(key, out);
   return out;
 }
 
-// Traduce un texto a todos los idiomas distintos presentes en la sala (una sola vez por idioma)
+// Traduce un texto a todos los idiomas distintos presentes en la sala (una sola
+// vez por idioma). Si falla, guarda null explícito — así el llamador puede
+// distinguir "no hacía falta traducir" (mismo idioma) de "se intentó y falló".
 async function translateForRoom(code, text, fromLang) {
   const langs = new Set(membersOf(code).map(m => m.lang));
   langs.delete(fromLang);
   const result = {};
   await Promise.all([...langs].map(async l => {
-    try { result[l] = await translate(text, fromLang, l); } catch (_) { /* preview fallida: se ignora */ }
+    try { result[l] = await translate(text, fromLang, l); }
+    catch (_) { result[l] = null; } // se intentó traducir y falló: NO es lo mismo que "no hacía falta"
   }));
   return result;
 }
@@ -259,10 +276,13 @@ wss.on('connection', (ws) => {
       for (const client of set) {
         if (client.readyState !== 1) continue;
         if (client === ws) continue; // el emisor ya ve su propio original en pantalla
-        const v = versions[client.meta.lang];
+        const sameLang = client.meta.lang === m.lang;
+        let translated, ok;
+        if (sameLang) { translated = text; ok = true; }        // mismo idioma: no hacía falta traducir
+        else { const v = versions[client.meta.lang]; translated = v; ok = Boolean(v); } // v===null si falló
         client.send(JSON.stringify({
           t: 'speech', id: m.id, name: m.name,
-          text: v || text, ok: Boolean(v)
+          original: text, translated, ok
         }));
       }
       return;
